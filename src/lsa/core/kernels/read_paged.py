@@ -82,6 +82,149 @@ def build_keep_ids(
     return keep, counts
 
 
+def paged_attention_pooled(
+    q_flat: torch.Tensor,
+    pool_k: torch.Tensor,
+    pool_v: torch.Tensor,
+    keep: torch.Tensor,
+    counts: torch.Tensor,
+    scale: float,
+    block_size: int = 128,
+    chunk: int = 256,
+    backend: str = "fa",
+) -> torch.Tensor:
+    """Attention over each query's keep set, rows gathered from a flat slot-indexed KV pool.
+
+    Serving form of `paged_topk_attention`: keys and values live in the paged cache flattened to
+    [slots, Hkv, Dh], and `keep` holds absolute positions mapped to slots by the caller's slot
+    table before this call.
+
+    Two backends:
+    - "fa": rows are grouped by their exact keep count, each group's keep rows are gathered into a
+      per-row batch [g, L, Hkv, Dh] and read with `npu_fusion_attention` (one query per batch row,
+      no padding, so no mask). Repeatable across calls - this is the serving backend. The mask
+      input of the fusion attention is unreliable at large key widths on CANN 9.2.1 (returns wrong
+      output for L >= ~2052, exact at L = 16), which is why rows are grouped instead of masked.
+    - "v2": the production paged-attention op. **One call per process** - a second invocation
+      faults the device even with identical inputs (REPORT 20.14), so this is offline/parity only.
+
+    Args:
+        q_flat: Queries [N, H, Dh].
+        pool_k / pool_v: Key / value pools [S, Hkv, Dh], slot-indexed.
+        keep: Keep slot ids [N, L] int64, PAD (-1) right-padded, sorted ascending per row.
+        counts: Live keep entries per row [N] int64.
+        scale: Multiplier applied to query-key scores.
+        block_size: Compact cache block the v2 backend packs the gathered rows into.
+        chunk: Queries per call, at most 256.
+        backend: "fa" (serving) or "v2" (one-shot).
+
+    Returns:
+        Attention output [N, H, Dh], q's dtype and device.
+    """
+    if backend == "fa":
+        return _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk)
+    return _pooled_v2_read(q_flat, pool_k, pool_v, keep, counts, scale, block_size, chunk)
+
+
+def _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk):
+    import torch_npu
+    from torch_npu import npu_fusion_attention
+
+    n, head_count, head_dim = q_flat.shape
+    out = torch.empty(n, head_count, head_dim, device=q_flat.device, dtype=q_flat.dtype)
+    live = counts.to(torch.int64).clamp_min(1)
+    order = torch.argsort(live)
+    sorted_live = live[order]
+    done = 0
+    while done < n:
+        end = min(done + chunk, n)
+        idx = order[done:end]
+        group_live = sorted_live[done:end]
+        # Rows sharing an exact keep count read together, width = that count, nothing padded
+        uniq = torch.unique(group_live)
+        for c in uniq.tolist():
+            sel = idx[group_live == c]
+            rows_keep = keep[sel][:, :c]
+            gathered_k = pool_k[rows_keep]
+            gathered_v = pool_v[rows_keep]
+            q = q_flat[sel].view(sel.shape[0], 1, head_count, head_dim).contiguous()
+            res = npu_fusion_attention(
+                q,
+                gathered_k,
+                gathered_v,
+                head_num=head_count,
+                input_layout="BSND",
+                scale=scale,
+                pre_tockens=int(c),
+                next_tockens=0,
+            )
+            out[sel] = res[0].view(sel.shape[0], head_count, head_dim)
+        done = end
+    torch.npu.synchronize()
+    return out
+
+
+def _pooled_v2_read(q_flat, pool_k, pool_v, keep, counts, scale, block_size, chunk):
+    import torch_npu
+
+    n, head_count, head_dim = q_flat.shape
+    kv_head_count = pool_k.shape[1]
+    q = q_flat.contiguous()
+    out = torch.empty_like(q)
+
+    # Rows are processed in chunks: a single gather over all rows can exceed the 4 GB
+    # single-tensor addressing limit on the NPU (errcode 95 / invalid GM address), and the
+    # op itself takes at most `chunk` rows per call.
+    done = 0
+    while done < n:
+        end = min(done + chunk, n)
+        rows_keep = keep[done:end]
+        max_keep = rows_keep.shape[1]
+        max_blocks = (max_keep + block_size - 1) // block_size
+        padded = max_blocks * block_size
+        rows_n = end - done
+
+        pad = torch.where(rows_keep == PAD, torch.zeros_like(rows_keep), rows_keep)
+        gathered_k = pool_k[pad]
+        gathered_v = pool_v[pad]
+        live = rows_keep != PAD
+        gathered_k = torch.where(live[:, :, None, None], gathered_k, torch.zeros_like(gathered_k))
+        gathered_v = torch.where(live[:, :, None, None], gathered_v, torch.zeros_like(gathered_v))
+        if padded > max_keep:
+            tail_k = torch.zeros(
+                rows_n, padded - max_keep, kv_head_count, head_dim, dtype=pool_k.dtype, device=q.device
+            )
+            tail_v = torch.zeros_like(tail_k)
+            gathered_k = torch.cat([gathered_k, tail_k], dim=1)
+            gathered_v = torch.cat([gathered_v, tail_v], dim=1)
+
+        cache_k = (
+            gathered_k.view(rows_n, max_blocks, block_size, kv_head_count, head_dim)
+            .reshape(-1, block_size, kv_head_count, head_dim)
+            .contiguous()
+        )
+        cache_v = (
+            gathered_v.view(rows_n, max_blocks, block_size, kv_head_count, head_dim)
+            .reshape(-1, block_size, kv_head_count, head_dim)
+            .contiguous()
+        )
+        block_table = torch.arange(rows_n * max_blocks, device=q.device, dtype=torch.int32).view(rows_n, max_blocks)
+        torch.ops.atb._npu_paged_attention_v2.out(
+            q[done:end],
+            cache_k,
+            block_table,
+            counts[done:end].tolist(),
+            value_cache=cache_v,
+            num_kv_heads=kv_head_count,
+            num_heads=head_count,
+            scale_value=scale,
+            out=out[done:end],
+        )
+        done = end
+    torch.npu.synchronize()
+    return out
+
+
 def paged_topk_attention(
     q: torch.Tensor,
     k: torch.Tensor,
