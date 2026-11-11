@@ -20,6 +20,7 @@ import torch
 
 PAD = -1
 _LOG = logging.getLogger(__name__)
+_BMM_T = [0.0, 0.0, 0.0, 0.0, 0]
 
 
 def build_keep_ids(
@@ -28,6 +29,7 @@ def build_keep_ids(
     window: int,
     sink: int,
     key_count: int,
+    max_keep: int | None = None,
 ) -> torch.Tensor:
     """Return sorted, deduplicated, causal keep ids per query, right-padded with PAD.
 
@@ -72,7 +74,8 @@ def build_keep_ids(
         [torch.ones_like(sorted_ids[:, :1], dtype=torch.bool), sorted_ids[:, 1:] != sorted_ids[:, :-1]], dim=1
     )
     counts = first.sum(dim=1)
-    max_keep = int(counts.max().item()) if n else 0
+    if max_keep is None:
+        max_keep = int(counts.max().item()) if n else 0
 
     flat_rank = torch.cumsum(first.long(), dim=1) - 1
     keep = torch.full((n, max_keep), PAD, dtype=torch.int64, device=device)
@@ -92,6 +95,7 @@ def paged_attention_pooled(
     block_size: int = 128,
     chunk: int = 256,
     backend: str = "fa",
+    gather=None,
 ) -> torch.Tensor:
     """Attention over each query's keep set, rows gathered from a flat slot-indexed KV pool.
 
@@ -100,11 +104,15 @@ def paged_attention_pooled(
     table before this call.
 
     Two backends:
+    - "bmm": the serving backend. Per 256-row sub-batch: gather kv (callers pass a `gather` that
+      reads the paged cache into persistent buffers), QK einsum, one fp32 softmax with the PAD
+      mask (rows need no grouping by keep count), PV einsum. ~4 TB/s effective on the gathered
+      kv vs ~43 GB/s for the fusion attention at these GQA-broadcast shapes.
     - "fa": rows are grouped by their exact keep count, each group's keep rows are gathered into a
       per-row batch [g, L, Hkv, Dh] and read with `npu_fusion_attention` (one query per batch row,
-      no padding, so no mask). Repeatable across calls - this is the serving backend. The mask
-      input of the fusion attention is unreliable at large key widths on CANN 9.2.1 (returns wrong
-      output for L >= ~2052, exact at L = 16), which is why rows are grouped instead of masked.
+      no padding, so no mask). The mask input of the fusion attention is unreliable at large key
+      widths on CANN 9.2.1 (returns wrong output for L >= ~2052, exact at L = 16), which is why
+      rows are grouped instead of masked. Kept as a reference backend.
     - "v2": the production paged-attention op. **One call per process** - a second invocation
       faults the device even with identical inputs (REPORT 20.14), so this is offline/parity only.
 
@@ -122,13 +130,86 @@ def paged_attention_pooled(
         Attention output [N, H, Dh], q's dtype and device.
     """
     if backend == "fa":
-        return _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk)
+        return _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
+    if backend == "bmm":
+        return _pooled_bmm_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
     return _pooled_v2_read(q_flat, pool_k, pool_v, keep, counts, scale, block_size, chunk)
 
 
-def _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk):
+def _pooled_bmm_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather=None):
+    # manual GQA attention over each row's keep set: QK bmm, one fp32 softmax over the
+    # whole keep row (PAD masked), PV bmm. npu_fusion_attention reaches only ~0.1 ms per
+    # query row at these shapes (GQA broadcast, ~43 GB/s effective); the bmm form reads the
+    # gathered kv twice at full bandwidth. Rows are processed in sub-batches of `chunk`;
+    # rows with different keep counts need no grouping - PAD scores are masked.
+    import os
+    import time
+
+    bmm_timed = os.environ.get("VLLM_BMM_TIME") == "1"
+    t_gather = t_qk = t_sm = t_pv = 0.0
+    if gather is None:
+        gather = lambda ids: (pool_k[ids], pool_v[ids])
+
+    n, head_count, head_dim = q_flat.shape
+    kv_head_count = pool_k.shape[1] if pool_k is not None else None
+    out = torch.empty(n, head_count, head_dim, device=q_flat.device, dtype=q_flat.dtype)
+    neg_inf = float("-inf")
+    done = 0
+    while done < n:
+        end = min(done + chunk, n)
+        rows_keep = keep[done:end]
+        sb, width = rows_keep.shape
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_a = time.perf_counter()
+        gk, gv = gather(rows_keep.clamp(0))
+        gk = gk.view(sb, width, -1, head_dim)
+        gv = gv.view(sb, width, -1, head_dim)
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_b = time.perf_counter()
+            t_gather += t_b - t_a
+        kv_head_count = gk.shape[2]
+        hpg = head_count // kv_head_count
+        q_b = q_flat[done:end].view(sb, kv_head_count, hpg, head_dim)
+        pad = rows_keep == PAD
+        scores = torch.einsum("bgqd,bsgd->bgqs", q_b, gk).float() * scale
+        scores.masked_fill_(pad[:, None, None, :], neg_inf)
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_c = time.perf_counter()
+            t_qk += t_c - t_b
+        probs = torch.softmax(scores, dim=-1).to(q_b.dtype)
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_d = time.perf_counter()
+            t_sm += t_d - t_c
+        o = torch.einsum("bgqs,bsgd->bgqd", probs, gv)
+        out[done:end] = o.reshape(sb, head_count, head_dim)
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_e = time.perf_counter()
+            t_pv += t_e - t_d
+        done = end
+    if bmm_timed:
+        torch.npu.synchronize()
+        _BMM_T[0] += t_gather
+        _BMM_T[1] += t_qk
+        _BMM_T[2] += t_sm
+        _BMM_T[3] += t_pv
+        _BMM_T[4] += 1
+        if _BMM_T[4] % 64 == 0:
+            print(f"BMM time: gather={_BMM_T[0]:.1f}s qk={_BMM_T[1]:.1f}s "
+                  f"softmax={_BMM_T[2]:.1f}s pv={_BMM_T[3]:.1f}s calls={_BMM_T[4]}", flush=True)
+    return out
+
+
+def _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather=None):
     import torch_npu
     from torch_npu import npu_fusion_attention
+
+    if gather is None:
+        gather = lambda ids: (pool_k[ids], pool_v[ids])
 
     n, head_count, head_dim = q_flat.shape
     out = torch.empty(n, head_count, head_dim, device=q_flat.device, dtype=q_flat.dtype)
@@ -140,25 +221,39 @@ def _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk):
         end = min(done + chunk, n)
         idx = order[done:end]
         group_live = sorted_live[done:end]
-        # Rows sharing an exact keep count read together, width = that count, nothing padded
-        uniq = torch.unique(group_live)
-        for c in uniq.tolist():
+        # Rows sharing an exact keep count read together, width = that count, nothing padded.
+        # Batch rows are padded UP to `chunk` with duplicated rows (their outputs land on
+        # duplicated sel ids, same value) so the op sees a fixed (chunk, c) shape per width
+        # class - unique shapes defeat the aclnn tiling cache and cost ~100ms per call.
+        uniq = torch.unique(group_live).tolist()
+        for c in uniq:
             sel = idx[group_live == c]
-            rows_keep = keep[sel][:, :c]
-            gathered_k = pool_k[rows_keep]
-            gathered_v = pool_v[rows_keep]
-            q = q_flat[sel].view(sel.shape[0], 1, head_count, head_dim).contiguous()
-            res = npu_fusion_attention(
-                q,
-                gathered_k,
-                gathered_v,
-                head_num=head_count,
-                input_layout="BSND",
-                scale=scale,
-                pre_tockens=int(c),
-                next_tockens=0,
-            )
-            out[sel] = res[0].view(sel.shape[0], head_count, head_dim)
+            m = sel.shape[0]
+            # each sub-batch is padded to exactly `chunk` rows so the op sees one fixed
+            # (chunk, c) shape; gathered kv stays under the 4 GB single-tensor limit
+            for start in range(0, m, chunk):
+                sub = sel[start : start + chunk]
+                sb = sub.shape[0]
+                pad_n = chunk - sb
+                rows_keep = keep[sub][:, :c]
+                sel_q = q_flat[sub]
+                if pad_n:
+                    rows_keep = torch.cat([rows_keep, rows_keep[-1:].expand(pad_n, -1)], 0)
+                    sel_q = torch.cat([sel_q, sel_q[-1:].expand(pad_n, -1, -1)], 0)
+                    sub = torch.cat([sub, sub[-1:].expand(pad_n)], 0)
+                gathered_k, gathered_v = gather(rows_keep)
+                q = sel_q.view(-1, 1, head_count, head_dim).contiguous()
+                res = npu_fusion_attention(
+                    q,
+                    gathered_k,
+                    gathered_v,
+                    head_num=head_count,
+                    input_layout="BSND",
+                    scale=scale,
+                    pre_tockens=int(c),
+                    next_tockens=0,
+                )
+                out[sub] = res[0].view(-1, head_count, head_dim)
         done = end
     torch.npu.synchronize()
     return out
