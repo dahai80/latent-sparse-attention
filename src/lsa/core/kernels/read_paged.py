@@ -232,7 +232,9 @@ def _pooled_compact_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gat
         if bmm_timed:
             torch.npu.synchronize()
             t_a = time.perf_counter()
-        uniq, inv = torch.unique(rows_keep, return_inverse=True)
+        # int32 unique: same union (slot ids < 2^31), ~40% cheaper sort
+        uniq, inv = torch.unique(rows_keep.to(torch.int32), return_inverse=True)
+        uniq = uniq.to(torch.int64)
         u = uniq.shape[0]
         if bmm_timed:
             torch.npu.synchronize()
@@ -247,10 +249,13 @@ def _pooled_compact_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gat
         cv2 = cv.transpose(0, 1).contiguous()
         IDX = inv.unsqueeze(1).unsqueeze(2).expand(-1, kv_head_count, hpg, -1).contiguous()
         q_b = q_flat[done:end].view(sb, kv_head_count, hpg, head_dim)
+        # scores stay bf16 (bmm native output, same rounding as the bmm backend's
+        # bf16 bmm output); scale is applied in fp32 after the gather, halving the
+        # scores_u materialization traffic
         scores_u = torch.bmm(
             q_b.permute(1, 0, 2, 3).reshape(kv_head_count, sb * hpg, head_dim), ck2.transpose(1, 2)
-        ).float() * scale
-        sc_row = scores_u.view(kv_head_count, sb, hpg, u).permute(1, 0, 2, 3).gather(3, IDX)
+        )
+        sc_row = scores_u.view(kv_head_count, sb, hpg, u).permute(1, 0, 2, 3).gather(3, IDX).float() * scale
         pad = torch.arange(width, device=q_b.device)[None, :] >= counts[done:end].to(torch.int64)[:, None]
         if pad.any():
             sc_row = sc_row.masked_fill(pad[:, None, None, :], float("-inf"))
