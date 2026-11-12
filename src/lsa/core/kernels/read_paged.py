@@ -135,6 +135,10 @@ def paged_attention_pooled(
         return _pooled_bmm_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
     if backend == "compact":
         return _pooled_compact_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
+    if backend == "compact_blocks":
+        # blocks entry: keep = per-row qsa-block ids [N, B] (first-key slot >> 2);
+        # counts = per-key validity [N, B*4] in expanded key order
+        return _compact_blocks_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
     return _pooled_v2_read(q_flat, pool_k, pool_v, keep, counts, scale, block_size, chunk)
 
 
@@ -286,6 +290,90 @@ def _pooled_compact_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gat
         _BMM_T[4] += 1
         if _BMM_T[4] % 64 == 0:
             print(f"BMM time(compact): uniq={_BMM_T[0]:.1f}s qk={_BMM_T[1]:.1f}s "
+                  f"softmax={_BMM_T[2]:.1f}s pv={_BMM_T[3]:.1f}s calls={_BMM_T[4]}", flush=True)
+    return out
+
+
+def _compact_blocks_read(q_flat, pool_k, pool_v, qids, valid, scale, chunk, gather=None):
+    # E43: block-level compact attention. Callers pass per-row QSA-block slot ids
+    # (slot of the block's first key >> 2, -1 invalid) instead of expanded key slots.
+    # The union is taken at block level ([rows, B] instead of [rows, B*4]), the key-level
+    # union follows by arithmetic (4 consecutive slots per block), and the per-row index
+    # map is built without a second sort. One softmax per row over its live keys, exactly
+    # the bmm/compact semantics with invalid blocks masked.
+    import os
+    import time
+
+    bmm_timed = os.environ.get("VLLM_BMM_TIME") == "1"
+    t_uniq = t_qk = t_sm = t_pv = 0.0
+    if gather is None:
+        gather = lambda ids: (pool_k[ids.clamp(0)], pool_v[ids.clamp(0)])
+
+    n, head_count, head_dim = q_flat.shape
+    out = torch.empty(n, head_count, head_dim, device=q_flat.device, dtype=q_flat.dtype)
+    neg_inf = float("-inf")
+    done = 0
+    while done < n:
+        end = min(done + chunk, n)
+        sb, blk = qids[done:end].shape
+        width = blk * 4
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_a = time.perf_counter()
+        bvalid = valid[done:end].view(sb, blk, 4).any(-1)
+        qb = torch.where(bvalid, qids[done:end], torch.full_like(qids[done:end], -1))
+        uniq_b, inv_b = torch.unique(qb.to(torch.int32), return_inverse=True)
+        uniq_b = uniq_b.to(torch.int64)
+        ub = uniq_b.shape[0]
+        slots_u = ((uniq_b << 2).clamp_min(0)[:, None] + torch.arange(4, device=qids.device)[None, :]).view(-1)
+        gku, gvu = gather(slots_u.view(1, -1))
+        ck = gku.view(-1, gku.shape[-2], head_dim)
+        cv = gvu.view(-1, gvu.shape[-2], head_dim)
+        kv_head_count = ck.shape[1]
+        hpg = head_count // kv_head_count
+        ck2 = ck.transpose(0, 1).contiguous()
+        cv2 = cv.transpose(0, 1).contiguous()
+        IDX = (inv_b[:, :, None] * 4 + torch.arange(4, device=qids.device)[None, None, :]).view(sb, width)
+        IDX = IDX.unsqueeze(1).unsqueeze(2).expand(-1, kv_head_count, hpg, -1).contiguous()
+        pad = ~valid[done:end]
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_b = time.perf_counter()
+            t_uniq += t_b - t_a
+        q_b = q_flat[done:end].view(sb, kv_head_count, hpg, head_dim)
+        scores_u = torch.bmm(
+            q_b.permute(1, 0, 2, 3).reshape(kv_head_count, sb * hpg, head_dim), ck2.transpose(1, 2)
+        )
+        sc_row = scores_u.view(kv_head_count, sb, hpg, ub * 4).permute(1, 0, 2, 3).gather(3, IDX).float() * scale
+        if pad.any():
+            sc_row = sc_row.masked_fill(pad[:, None, None, :], neg_inf)
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_c = time.perf_counter()
+            t_qk += t_c - t_b
+        probs = torch.softmax(sc_row, dim=-1).to(q_b.dtype)
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_d = time.perf_counter()
+            t_sm += t_d - t_c
+        probs_u = torch.zeros(kv_head_count, sb, hpg, ub * 4, device=q_flat.device, dtype=q_b.dtype)
+        probs_u.scatter_(3, IDX.permute(1, 0, 2, 3).contiguous(), probs.permute(1, 0, 2, 3).contiguous())
+        o = torch.bmm(probs_u.view(kv_head_count, sb * hpg, ub * 4), cv2)
+        out[done:end] = o.view(kv_head_count, sb, hpg, head_dim).permute(1, 0, 2, 3).reshape(sb, head_count, head_dim)
+        if bmm_timed:
+            torch.npu.synchronize()
+            t_e = time.perf_counter()
+            t_pv += t_e - t_d
+        done = end
+    if bmm_timed:
+        torch.npu.synchronize()
+        _BMM_T[0] += t_uniq
+        _BMM_T[1] += t_qk
+        _BMM_T[2] += t_sm
+        _BMM_T[3] += t_pv
+        _BMM_T[4] += 1
+        if _BMM_T[4] % 64 == 0:
+            print(f"BMM time(compact_blocks): uniq={_BMM_T[0]:.1f}s qk={_BMM_T[1]:.1f}s "
                   f"softmax={_BMM_T[2]:.1f}s pv={_BMM_T[3]:.1f}s calls={_BMM_T[4]}", flush=True)
     return out
 
