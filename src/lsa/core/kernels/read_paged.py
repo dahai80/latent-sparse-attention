@@ -133,6 +133,8 @@ def paged_attention_pooled(
         return _pooled_fa_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
     if backend == "bmm":
         return _pooled_bmm_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
+    if backend == "aclnn":
+        return _pooled_aclnn_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
     if backend == "compact":
         return _pooled_compact_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather)
     if backend == "compact_blocks":
@@ -600,3 +602,37 @@ def paged_topk_attention(
         done = end
 
     return out.view(batch_size, query_count, head_count, head_dim).to(q.dtype)
+
+
+
+def _pooled_aclnn_read(q_flat, pool_k, pool_v, keep, counts, scale, chunk, gather=None):
+    # aclnnCompactRead (E44 M2 fused kernel): replaces the QK+softmax+PV section of the
+    # compact backend; uniq/inv mapping and union gather stay in torch. Env VLLM_QSA_ACLNN=1.
+    # Kernel parity PASS at serving geometry (D=256 W=2052 U=8192) and torch binding PASS
+    # (2026-11-13, e44-d3/davinci3). Perf verdict: kernel 20.2ms vs torch compact path
+    # 1.13ms at sb=32 (18x slower, vector gather vs cube bmm) — keep OFF in prod; torch
+    # compact path stays the production route. See docs/e44_ascendc_project.md 8.5.
+    from lsa.core.kernels.compact_read_acl import compact_read_bf16
+
+    n, head_count, head_dim = q_flat.shape
+    out = torch.empty(n, head_count, head_dim, device=q_flat.device, dtype=q_flat.dtype)
+    done = 0
+    while done < n:
+        end = min(done + chunk, n)
+        rows_keep = keep[done:end]
+        sb, width = rows_keep.shape
+        uniq, inv = torch.unique(rows_keep.to(torch.int32), return_inverse=True)
+        uniq = uniq.to(torch.int64)
+        gku, gvu = gather(uniq.clamp(0).view(1, -1))
+        ck = gku.reshape(-1, gku.shape[-2], head_dim).contiguous()
+        cv = gvu.reshape(-1, gku.shape[-2], head_dim).contiguous()
+        idx = inv.contiguous().to(torch.int32)
+        pad = torch.arange(width, device=q_flat.device)[None, :] >= counts[done:end].to(torch.int64)[:, None]
+        valid = (~pad).to(torch.uint8).contiguous()
+        rows_out = compact_read_bf16(
+            q_flat[done:end].reshape(sb, head_count, head_dim).contiguous(),
+            ck, cv, idx, valid, scale, None,
+        )
+        out[done:end] = rows_out.reshape(sb, head_count, head_dim)
+        done = end
+    return out
